@@ -1,11 +1,10 @@
 /*
- * browser-mini - minimal WebKitGTK 6.0 (GTK4) page viewer
+ * minibrowser - minimal WebKitGTK 6.0 (GTK4) page viewer
  *
  * build (Debian/derivatives: apt install build-essential pkg-config
  *        libgtk-4-dev libwebkitgtk-6.0-dev libsoup-3.0-dev):
  *
- *   gcc -O2 -Wall -Wextra -o browser-mini browser-mini.c \
- *       $(pkg-config --cflags --libs gtk4 webkitgtk-6.0 libsoup-3.0)
+gcc -O2 -Wall -Wextra -o minibrowser minibrowser.c $(pkg-config --cflags --libs gtk4 webkitgtk-6.0 libsoup-3.0)
  *
  * Run with -h for the full option and key list.
  */
@@ -26,7 +25,7 @@
 #include <unistd.h>
 
 #define DEFAULT_TITLE    "Minibrowser"
-#define DEFAULT_APP_ID   "browser-mini"
+#define DEFAULT_APP_ID   "minibrowser"
 #define DEFAULT_CLIP_CMD "wl-copy"
 
 /* Directory name used under ~/.local/share and ~/.cache for profiles.
@@ -39,6 +38,15 @@
 #define ZOOM_MAX  5.0
 
 #define URL_TOAST_SECONDS 4
+
+/* download overlay */
+#define DL_LINGER_SECONDS  4      /* keep a finished download on screen */
+#define DL_HISTORY_SECONDS 8      /* how long <mod>+D keeps the list up */
+#define DL_TICK_MS         250    /* progress / ETA refresh rate */
+#define DL_ACTIVE_ROWS     4      /* max rows in the live overlay */
+#define DL_HISTORY_ROWS    8      /* max rows in the <mod>+D list */
+#define DL_KEEP            32     /* max downloads remembered */
+#define DL_NAME_CHARS      30     /* filenames are elided to this */
 
 /* Modifiers we consider "significant" when matching a shortcut.
  * Shift is deliberately absent: it is part of the key, not the combo. */
@@ -72,13 +80,41 @@ static const char     *g_mod_name = "Ctrl";
 
 #define LOG(...) G_STMT_START { if (!g_quiet) g_printerr (__VA_ARGS__); } G_STMT_END
 
+/* One tracked download. Lives in g_downloads; the WebKitDownload keeps a
+ * pointer to it under the "dl" data key. */
+typedef enum { DL_ACTIVE, DL_DONE, DL_FAILED } DlState;
+
+typedef struct {
+    char    *name;
+    DlState  state;
+    double   progress;      /* 0..1, 0 when the size is unknown */
+    guint64  received;
+    guint64  total;
+    gint64   start_us;
+    gint64   end_us;
+
+    /* smoothed transfer rate, so the ETA is not thrown off by the first
+     * burst out of the socket buffer */
+    double   rate;          /* bytes/s, exponentially smoothed */
+    gint64   rate_us;       /* when the rate was last sampled */
+    guint64  rate_bytes;    /* bytes received at that sample */
+} Dl;
+
+static GPtrArray *g_downloads;   /* Dl*,  oldest first */
+static GPtrArray *g_wins;        /* Win*, every open window */
+static guint      g_dl_tick;     /* refresh timer, runs only when needed */
+
 /* Per-window state. Owned by the GtkWindow (see window_new). */
 typedef struct {
     GtkWidget     *win;
     WebKitWebView *view;
     GtkWidget     *urlbar;      /* GtkEntry, top left, hidden by default  */
-    GtkWidget     *toast;       /* GtkLabel, top right, hidden by default */
+    GtkWidget     *topright;    /* box holding the toast and the downloads */
+    GtkWidget     *toast;       /* GtkLabel, hidden by default            */
+    GtkWidget     *dlpanel;     /* download overlay, rebuilt on refresh   */
     guint          toast_id;
+    gboolean       dl_history;  /* <mod>+D list is showing                */
+    guint          dl_history_id;
     gboolean       primary;
 } Win;
 
@@ -97,6 +133,55 @@ static GtkWidget *on_create        (WebKitWebView *view, WebKitNavigationAction 
 static void       on_ready_to_show (WebKitWebView *view, gpointer u);
 static void       on_session_download_started (WebKitNetworkSession *session,
                                                WebKitDownload *download, gpointer u);
+static void       downloads_refresh (void);
+static void       downloads_tick_start (void);
+
+/* ------------------------------------------------------ small formatters */
+
+static char *
+format_size (guint64 bytes)
+{
+    if (bytes >= 1024ULL * 1024 * 1024)
+        return g_strdup_printf ("%.1f GB", bytes / (1024.0 * 1024 * 1024));
+    if (bytes >= 1024ULL * 1024)
+        return g_strdup_printf ("%.1f MB", bytes / (1024.0 * 1024));
+    if (bytes >= 1024)
+        return g_strdup_printf ("%.0f kB", bytes / 1024.0);
+    return g_strdup_printf ("%" G_GUINT64_FORMAT " B", bytes);
+}
+
+static char *
+format_seconds (double secs)
+{
+    if (secs < 1)
+        return g_strdup ("<1s");
+    if (secs < 60)
+        return g_strdup_printf ("%.0fs", secs);
+    if (secs < 3600)
+        return g_strdup_printf ("%dm%02ds", (int) secs / 60, (int) secs % 60);
+    return g_strdup_printf ("%dh%02dm", (int) secs / 3600, ((int) secs % 3600) / 60);
+}
+
+/* Middle-elide, so both the stem and the extension stay readable. */
+static char *
+elide (const char *s, int max_chars)
+{
+    if (!s)
+        return g_strdup ("");
+
+    glong len = g_utf8_strlen (s, -1);
+    if (len <= max_chars)
+        return g_strdup (s);
+
+    int keep  = max_chars - 1;
+    int left  = keep / 2;
+    int right = keep - left;
+
+    char *head = g_strndup (s, (gsize) (g_utf8_offset_to_pointer (s, left) - s));
+    char *out  = g_strconcat (head, "…", g_utf8_offset_to_pointer (s, len - right), NULL);
+    g_free (head);
+    return out;
+}
 
 /* ------------------------------------------------------------- helpers */
 
@@ -198,6 +283,11 @@ usage (const char *argv0, gboolean to_stdout)
 "  --devtools          open the inspector once the first page commits\n"
 "  --no-media          deny camera / microphone / screen-share requests\n"
 "\n"
+"  A download shows a progress bar in the top right corner with the file\n"
+"  name, percentage and estimated time left. Move the pointer over it and\n"
+"  it fades out so you can read the page underneath; it disappears on its\n"
+"  own %d seconds after the transfer ends.\n"
+"\n"
 "session:\n"
 "  --download-dir DIR  download target (default: XDG download dir)\n"
 "  --profile NAME      named profile, persists cookies (default: \"default\")\n"
@@ -213,7 +303,8 @@ usage (const char *argv0, gboolean to_stdout)
 "key bindings (<mod> = %s):\n"
 "  <mod>+R  or F5      reload the page\n"
 "  <mod>+Shift+R       re-read the --css file, then reload\n"
-"  <mod>+D  or F12     toggle the developer tools\n"
+"  <mod>+D  or <mod>+J list the recent downloads for %d seconds\n"
+"  F12, <mod>+Shift+D  toggle the developer tools\n"
 "  <mod>+Shift+I       toggle the developer tools\n"
 "  <mod>+O             open the URL bar (top left, white on black)\n"
 "                      Enter loads, Esc cancels\n"
@@ -229,7 +320,8 @@ usage (const char *argv0, gboolean to_stdout)
 "  open every key except Esc belongs to it, so <mod>+A selects its text.\n"
 "%s",
         DEFAULT_TITLE, argv0, DEFAULT_TITLE, DEFAULT_APP_ID, g_mod_name,
-        DEFAULT_CLIP_CMD, g_mod_name, URL_TOAST_SECONDS,
+        DEFAULT_CLIP_CMD, DL_LINGER_SECONDS, g_mod_name, DL_HISTORY_SECONDS,
+        URL_TOAST_SECONDS,
         g_mod == GDK_CONTROL_MASK
             ? "  Use --mod alt if you would rather keep Ctrl+P for the page's"
               " print dialog.\n"
@@ -300,6 +392,28 @@ ui_css_install (void)
         "  background-color: #000; color: #fff;"
         "  font-family: monospace; font-size: 11pt;"
         "  padding: 6px 10px;"
+        "}"
+        "box.mini-dl {"
+        "  background-color: #000;"
+        "  padding: 6px 10px;"
+        "}"
+        "label.mini-dl-head {"
+        "  color: #999; font-family: monospace; font-size: 9pt;"
+        "}"
+        "label.mini-dl-done, label.mini-dl-failed {"
+        "  color: #fff; font-family: monospace; font-size: 10pt;"
+        "}"
+        "label.mini-dl-failed { color: #ff8080; }"
+        "progressbar.mini-dl-bar > text {"
+        "  color: #fff; font-family: monospace; font-size: 10pt;"
+        "}"
+        "progressbar.mini-dl-bar > trough {"
+        "  background-color: #262626; border: none; border-radius: 0;"
+        "  min-height: 6px;"
+        "}"
+        "progressbar.mini-dl-bar > trough > progress {"
+        "  background-color: #fff; border: none; border-radius: 0;"
+        "  min-height: 6px;"
         "}";
 
     GtkCssProvider *p = gtk_css_provider_new ();
@@ -437,6 +551,78 @@ clipboard_copy (Win *w, const char *text)
 
 /* -------------------------------------------------------------- download */
 
+static Dl *
+dl_get (WebKitDownload *download)
+{
+    return g_object_get_data (G_OBJECT (download), "dl");
+}
+
+static void
+dl_free (gpointer p)
+{
+    Dl *d = p;
+    g_free (d->name);
+    g_free (d);
+}
+
+static Dl *
+dl_new (WebKitDownload *download, const char *name)
+{
+    Dl *d = g_new0 (Dl, 1);
+
+    d->name     = g_strdup (name ? name : "download");
+    d->state    = DL_ACTIVE;
+    d->start_us = g_get_monotonic_time ();
+    d->rate_us  = d->start_us;
+
+    g_ptr_array_add (g_downloads, d);
+    while (g_downloads->len > DL_KEEP)
+        g_ptr_array_remove_index (g_downloads, 0);
+
+    g_object_set_data (G_OBJECT (download), "dl", d);
+    downloads_tick_start ();
+    return d;
+}
+
+/* The Dl may have been pushed out of the history by newer downloads. */
+static gboolean
+dl_alive (Dl *d)
+{
+    if (!d)
+        return FALSE;
+    for (guint i = 0; i < g_downloads->len; i++)
+        if (g_ptr_array_index (g_downloads, i) == d)
+            return TRUE;
+    return FALSE;
+}
+
+static void
+dl_set_name (WebKitDownload *download, const char *name)
+{
+    Dl *d = dl_get (download);
+    if (!dl_alive (d) || !name)
+        return;
+    g_free (d->name);
+    d->name = g_strdup (name);
+    downloads_refresh ();
+}
+
+static void
+dl_finish (WebKitDownload *download, DlState state)
+{
+    Dl *d = dl_get (download);
+    if (!dl_alive (d) || d->state != DL_ACTIVE)
+        return;
+
+    d->state  = state;
+    d->end_us = g_get_monotonic_time ();
+    if (state == DL_DONE && d->total == 0)
+        d->total = d->received;
+
+    downloads_tick_start ();      /* keeps ticking for the linger period */
+    downloads_refresh ();
+}
+
 static char *
 unique_download_path (const char *dir, const char *suggested)
 {
@@ -500,6 +686,11 @@ on_decide_destination (WebKitDownload *download,
     char *path = unique_download_path (absdir, suggested_filename);
 
     webkit_download_set_destination (download, path);
+
+    char *base = g_path_get_basename (path);
+    dl_set_name (download, base);
+    g_free (base);
+
     LOG ("download: %s -> %s\n", suggested_filename, path);
 
     g_free (path);
@@ -514,6 +705,7 @@ on_download_failed (WebKitDownload *download, GError *err, gpointer u)
     const char *dest = webkit_download_get_destination (download);
     g_printerr ("download: FAILED dest=%s err=%s\n",
                 dest ? dest : "(none)", err ? err->message : "(unknown)");
+    dl_finish (download, DL_FAILED);
 }
 
 static void
@@ -522,13 +714,37 @@ on_download_finished (WebKitDownload *download, gpointer u)
     (void) u;
     const char *dest = webkit_download_get_destination (download);
     LOG ("download: FINISHED dest=%s\n", dest ? dest : "(none)");
+    dl_finish (download, DL_DONE);   /* no-op if "failed" already fired */
 }
 
-/* Log at most once per 10% instead of once per received chunk. */
+/* Feeds the overlay on every chunk; logs at most once per 10%. */
 static void
 on_download_received_data (WebKitDownload *download, guint64 data_length, gpointer u)
 {
     (void) data_length; (void) u;
+
+    Dl *d = dl_get (download);
+    if (dl_alive (d)) {
+        d->progress = webkit_download_get_estimated_progress (download);
+        d->received = webkit_download_get_received_data_length (download);
+
+        if (d->total == 0) {
+            WebKitURIResponse *r = webkit_download_get_response (download);
+            if (r)
+                d->total = webkit_uri_response_get_content_length (r);
+        }
+
+        /* resample at most twice a second, then smooth */
+        gint64 now = g_get_monotonic_time ();
+        double dt  = (now - d->rate_us) / 1e6;
+
+        if (dt >= 0.5) {
+            double inst = (d->received - d->rate_bytes) / dt;
+            d->rate       = d->rate > 0 ? 0.7 * d->rate + 0.3 * inst : inst;
+            d->rate_us    = now;
+            d->rate_bytes = d->received;
+        }
+    }
 
     if (g_quiet)
         return;
@@ -545,6 +761,21 @@ on_download_received_data (WebKitDownload *download, guint64 data_length, gpoint
 static void
 download_wire (WebKitDownload *download)
 {
+    WebKitURIRequest *req  = webkit_download_get_request (download);
+    char             *name = NULL;
+
+    /* provisional name until decide-destination knows the real one */
+    if (req) {
+        char *path = g_filename_display_basename (webkit_uri_request_get_uri (req));
+        if (path && *path && !g_str_has_suffix (path, "/"))
+            name = path;
+        else
+            g_free (path);
+    }
+
+    dl_new (download, name);
+    g_free (name);
+
     g_signal_connect (download, "decide-destination", G_CALLBACK (on_decide_destination), NULL);
     g_signal_connect (download, "received-data",      G_CALLBACK (on_download_received_data), NULL);
     g_signal_connect (download, "finished",           G_CALLBACK (on_download_finished), NULL);
@@ -744,6 +975,231 @@ zoom_reset (Win *w)
     toast_show (w, "zoom 100%", 1);
 }
 
+/* ------------------------------------------------- download overlay */
+
+/* One row: a progress bar with the filename in its text for a running
+ * download, a plain line for a finished one. */
+static GtkWidget *
+dl_row_new (Dl *d)
+{
+    char *name = elide (d->name, DL_NAME_CHARS);
+    char *text;
+
+    if (d->state == DL_ACTIVE) {
+        char *eta = NULL;
+
+        /* Needs a size, a measured rate, and enough elapsed time that the
+         * rate means something - otherwise show no estimate at all rather
+         * than a wrong one. */
+        double elapsed = (g_get_monotonic_time () - d->start_us) / 1e6;
+
+        if (d->total > d->received && d->rate > 0 && elapsed > 1.5)
+            eta = format_seconds ((d->total - d->received) / d->rate);
+
+        if (d->total > 0) {
+            text = g_strdup_printf ("%s  %.0f%%%s%s", name, d->progress * 100.0,
+                                    eta ? "  " : "", eta ? eta : "");
+        } else {
+            /* no Content-Length: show what has arrived instead of a % */
+            char *got = format_size (d->received);
+            text = g_strdup_printf ("%s  %s", name, got);
+            g_free (got);
+        }
+        g_free (eta);
+
+        GtkWidget *bar = gtk_progress_bar_new ();
+        gtk_progress_bar_set_show_text (GTK_PROGRESS_BAR (bar), TRUE);
+        gtk_progress_bar_set_text (GTK_PROGRESS_BAR (bar), text);
+        gtk_progress_bar_set_fraction (GTK_PROGRESS_BAR (bar), CLAMP (d->progress, 0.0, 1.0));
+        gtk_widget_add_css_class (bar, "mini-dl-bar");
+
+        g_free (text);
+        g_free (name);
+        return bar;
+    }
+
+    if (d->state == DL_DONE) {
+        char *size = format_size (d->total ? d->total : d->received);
+        char *took = format_seconds ((d->end_us - d->start_us) / 1e6);
+        text = g_strdup_printf ("%s  done  %s  %s", name, size, took);
+        g_free (size);
+        g_free (took);
+    } else {
+        text = g_strdup_printf ("%s  failed", name);
+    }
+
+    GtkWidget *label = gtk_label_new (text);
+    gtk_widget_add_css_class (label, d->state == DL_DONE ? "mini-dl-done" : "mini-dl-failed");
+    gtk_label_set_xalign (GTK_LABEL (label), 0.0);
+    gtk_widget_set_halign (label, GTK_ALIGN_START);
+
+    g_free (text);
+    g_free (name);
+    return label;
+}
+
+static void
+dl_panel_rebuild (Win *w)
+{
+    GtkWidget *child;
+    while ((child = gtk_widget_get_first_child (w->dlpanel)))
+        gtk_box_remove (GTK_BOX (w->dlpanel), child);
+
+    gint64     now    = g_get_monotonic_time ();
+    gint64     linger = (gint64) DL_LINGER_SECONDS * G_USEC_PER_SEC;
+    GPtrArray *show   = g_ptr_array_new ();
+    guint      active = 0;
+
+    for (guint i = 0; i < g_downloads->len; i++)
+        if (((Dl *) g_ptr_array_index (g_downloads, i))->state == DL_ACTIVE)
+            active++;
+
+    if (w->dl_history) {
+        for (guint i = 0; i < g_downloads->len; i++)
+            g_ptr_array_add (show, g_ptr_array_index (g_downloads, i));
+        while (show->len > DL_HISTORY_ROWS)
+            g_ptr_array_remove_index (show, 0);
+    } else {
+        for (guint i = 0; i < g_downloads->len; i++) {
+            Dl *d = g_ptr_array_index (g_downloads, i);
+            if (d->state == DL_ACTIVE || now - d->end_us < linger)
+                g_ptr_array_add (show, d);
+        }
+        while (show->len > DL_ACTIVE_ROWS)
+            g_ptr_array_remove_index (show, 0);
+    }
+
+    if (show->len == 0 && !w->dl_history) {
+        gtk_widget_set_visible (w->dlpanel, FALSE);
+        g_ptr_array_free (show, TRUE);
+        return;
+    }
+
+    /* header: how many downloads there are */
+    char *head;
+    if (w->dl_history)
+        head = g_downloads->len
+             ? g_strdup_printf ("last downloads (%u)", g_downloads->len)
+             : g_strdup ("no downloads yet");
+    else if (active > 0)
+        head = g_strdup_printf ("downloading %u of %u", active, g_downloads->len);
+    else
+        head = g_strdup_printf ("downloads (%u)", g_downloads->len);
+
+    GtkWidget *hl = gtk_label_new (head);
+    gtk_widget_add_css_class (hl, "mini-dl-head");
+    gtk_label_set_xalign (GTK_LABEL (hl), 0.0);
+    gtk_widget_set_halign (hl, GTK_ALIGN_START);
+    gtk_box_append (GTK_BOX (w->dlpanel), hl);
+    g_free (head);
+
+    for (guint i = 0; i < show->len; i++)
+        gtk_box_append (GTK_BOX (w->dlpanel), dl_row_new (g_ptr_array_index (show, i)));
+
+    gtk_widget_set_visible (w->dlpanel, TRUE);
+    g_ptr_array_free (show, TRUE);
+}
+
+static void
+downloads_refresh (void)
+{
+    for (guint i = 0; i < g_wins->len; i++)
+        dl_panel_rebuild (g_ptr_array_index (g_wins, i));
+}
+
+/* Runs only while something is on screen: any active download, or a
+ * finished one still inside its linger window. */
+static gboolean
+dl_tick (gpointer u)
+{
+    (void) u;
+
+    gint64   now    = g_get_monotonic_time ();
+    gint64   linger = (gint64) DL_LINGER_SECONDS * G_USEC_PER_SEC;
+    gboolean busy   = FALSE;
+
+    for (guint i = 0; i < g_downloads->len && !busy; i++) {
+        Dl *d = g_ptr_array_index (g_downloads, i);
+        busy = (d->state == DL_ACTIVE) || (now - d->end_us < linger);
+    }
+
+    downloads_refresh ();
+
+    if (busy)
+        return G_SOURCE_CONTINUE;
+
+    g_dl_tick = 0;
+    return G_SOURCE_REMOVE;
+}
+
+static void
+downloads_tick_start (void)
+{
+    if (!g_dl_tick)
+        g_dl_tick = g_timeout_add (DL_TICK_MS, dl_tick, NULL);
+}
+
+static gboolean
+dl_history_timeout (gpointer u)
+{
+    Win *w = u;
+    w->dl_history    = FALSE;
+    w->dl_history_id = 0;
+    dl_panel_rebuild (w);
+    return G_SOURCE_REMOVE;
+}
+
+/* <mod>+D: show the recent downloads, press again to dismiss. */
+static void
+downloads_toggle_history (Win *w)
+{
+    if (w->dl_history_id) {
+        g_source_remove (w->dl_history_id);
+        w->dl_history_id = 0;
+    }
+
+    w->dl_history = !w->dl_history;
+
+    if (w->dl_history)
+        w->dl_history_id = g_timeout_add_seconds (DL_HISTORY_SECONDS,
+                                                  dl_history_timeout, w);
+    dl_panel_rebuild (w);
+}
+
+/* The overlay sits over the page, so fade it out while the pointer is on
+ * top of it - there may be something underneath worth reading. It is not
+ * click-targetable either, so this only affects what you see. */
+static void
+overlay_hover_update (Win *w, double x, double y)
+{
+    graphene_rect_t  bounds;
+    graphene_point_t point = GRAPHENE_POINT_INIT ((float) x, (float) y);
+    double           want  = 1.0;
+
+    if (gtk_widget_compute_bounds (w->topright, w->win, &bounds)) {
+        graphene_rect_inset (&bounds, -8.0f, -8.0f);      /* a little margin */
+        if (bounds.size.width > 1 && graphene_rect_contains_point (&bounds, &point))
+            want = 0.0;
+    }
+
+    if (gtk_widget_get_opacity (w->topright) != want)
+        gtk_widget_set_opacity (w->topright, want);
+}
+
+static void
+on_motion (GtkEventControllerMotion *c, double x, double y, gpointer u)
+{
+    (void) c;
+    overlay_hover_update (u, x, y);
+}
+
+static void
+on_motion_leave (GtkEventControllerMotion *c, gpointer u)
+{
+    (void) c;
+    gtk_widget_set_opacity (((Win *) u)->topright, 1.0);
+}
+
 /* ------------------------------------------------------------- windows */
 
 static gboolean
@@ -786,6 +1242,7 @@ on_key (GtkEventControllerKey *c, guint keyval, guint code,
     if (shift) {
         switch (key) {
         case GDK_KEY_i:
+        case GDK_KEY_d:                   /* <mod>+D itself lists downloads */
             inspector_toggle (w->view);
             return TRUE;
         case GDK_KEY_r:
@@ -806,7 +1263,8 @@ on_key (GtkEventControllerKey *c, guint keyval, guint code,
         return TRUE;
 
     case GDK_KEY_d:
-        inspector_toggle (w->view);
+    case GDK_KEY_j:                       /* the usual browser shortcut */
+        downloads_toggle_history (w);
         return TRUE;
 
     case GDK_KEY_o:
@@ -865,8 +1323,14 @@ static void
 win_free (gpointer data)
 {
     Win *w = data;
+
+    g_ptr_array_remove_fast (g_wins, w);
+
     if (w->toast_id)
         g_source_remove (w->toast_id);
+    if (w->dl_history_id)
+        g_source_remove (w->dl_history_id);
+
     g_free (w);
 }
 
@@ -930,16 +1394,29 @@ window_new (WebKitWebView *view, gboolean primary)
     g_signal_connect (w->urlbar, "activate", G_CALLBACK (on_urlbar_activate), w);
     gtk_overlay_add_overlay (GTK_OVERLAY (overlay), w->urlbar);
 
-    /* Toast: top right, click-through, hidden until <mod>+P or zoom */
+    /* Top right column: URL toast on top, downloads below. The whole
+     * column is click-through, so it never swallows a click on the page. */
+    w->topright = gtk_box_new (GTK_ORIENTATION_VERTICAL, 6);
+    gtk_widget_set_halign (w->topright, GTK_ALIGN_END);
+    gtk_widget_set_valign (w->topright, GTK_ALIGN_START);
+    gtk_widget_set_can_target (w->topright, FALSE);
+
     w->toast = gtk_label_new ("");
     gtk_widget_add_css_class (w->toast, "mini-toast");
     gtk_widget_set_halign (w->toast, GTK_ALIGN_END);
-    gtk_widget_set_valign (w->toast, GTK_ALIGN_START);
-    gtk_widget_set_can_target (w->toast, FALSE);
     gtk_widget_set_visible (w->toast, FALSE);
     gtk_label_set_ellipsize (GTK_LABEL (w->toast), PANGO_ELLIPSIZE_MIDDLE);
     gtk_label_set_max_width_chars (GTK_LABEL (w->toast), 90);
-    gtk_overlay_add_overlay (GTK_OVERLAY (overlay), w->toast);
+    gtk_box_append (GTK_BOX (w->topright), w->toast);
+
+    w->dlpanel = gtk_box_new (GTK_ORIENTATION_VERTICAL, 4);
+    gtk_widget_add_css_class (w->dlpanel, "mini-dl");
+    gtk_widget_set_halign (w->dlpanel, GTK_ALIGN_END);
+    gtk_widget_set_visible (w->dlpanel, FALSE);
+    gtk_widget_set_size_request (w->dlpanel, 320, -1);
+    gtk_box_append (GTK_BOX (w->topright), w->dlpanel);
+
+    gtk_overlay_add_overlay (GTK_OVERLAY (overlay), w->topright);
 
     gtk_window_set_child (GTK_WINDOW (w->win), overlay);
 
@@ -948,12 +1425,20 @@ window_new (WebKitWebView *view, gboolean primary)
     g_signal_connect (kc, "key-pressed", G_CALLBACK (on_key), w);
     gtk_widget_add_controller (w->win, kc);
 
+    GtkEventController *mc = gtk_event_controller_motion_new ();
+    g_signal_connect (mc, "motion", G_CALLBACK (on_motion), w);
+    g_signal_connect (mc, "leave",  G_CALLBACK (on_motion_leave), w);
+    gtk_widget_add_controller (w->win, mc);
+
     if (g_follow_page_title)
         g_signal_connect (view, "notify::title", G_CALLBACK (on_title), w);
 
     g_signal_connect (w->win, "map", G_CALLBACK (on_window_map), NULL);
     g_signal_connect (w->win, "destroy", G_CALLBACK (on_close), w);
     g_object_set_data_full (G_OBJECT (w->win), "win", w, win_free);
+
+    g_ptr_array_add (g_wins, w);
+    dl_panel_rebuild (w);         /* picks up downloads already running */
 
     g_windows++;
     return w->win;
@@ -1195,6 +1680,9 @@ main (int argc, char **argv)
 
     /* a clipboard helper that dies early must not take us with it */
     signal (SIGPIPE, SIG_IGN);
+
+    g_downloads = g_ptr_array_new_with_free_func (dl_free);
+    g_wins      = g_ptr_array_new ();
 
     gtk_init ();
     ui_css_install ();
